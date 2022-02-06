@@ -1,0 +1,85 @@
+if [ -z ${AWS_ACCESS_KEY_ID} ]; then
+    export AWS_ACCESS_KEY_ID='***'
+    export AWS_SECRET_ACCESS_KEY='***'
+fi
+
+REGIONS=(`aws ec2 describe-regions --region us-west-1 --output text | grep "-" | awk -F\t '{print $3}'`)
+for REGION in ${REGIONS[*]}; do
+    echo "=> $REGION"
+
+    aws ec2 describe-regions --query 'Regions[*].RegionName' --output text | tr '\t' '\n'
+    aws ec2 describe-security-groups --region $REGION --output text > $GFILE
+
+    EC2FILE='/tmp/aws-sec-groups-ec2'
+    aws ec2 describe-instances --query 'Reservations[*].Instances[*].SecurityGroups[*].GroupId' --output text --region $REGION | tr '\t' '\n' | sort | uniq > $EC2FILE
+
+    RDSFILE='/tmp/aws-sec-groups-rds'
+    aws rds describe-db-security-groups --query 'DBSecurityGroups[*].EC2SecurityGroups[*].EC2SecurityGroupId' --output text --region $REGION | tr '\t' '\n' | sort | uniq > $RDSFILE
+
+    old_IFS=$IFS; IFS=$'\n'
+    cat $GFILE | while read line
+    do
+        case $line in
+            # Header
+            SECURITYGROUPS*)
+                PORT_HAS_GLOBAL_RULE=0
+                SID=(`echo $line | awk -F\t '{print $3}'`)
+                GNAME=(`echo $line | awk -F\t '{print $4}'`)
+
+                EXTRA=""
+                grep $SID $EC2FILE &> /dev/null
+                if [ $? -ne 0 ]; then
+                    grep $SID $RDSFILE &> /dev/null
+                    if [ $? -ne 0 ]; then
+                      EXTRA=" <= ** Not currently used by any EC2 or RDS instance in this region!"
+                    fi
+                fi
+
+                echo "  => $SID ($GNAME) $EXTRA"
+                ;;
+
+            IPPERMISSIONS*)
+                INPORT=(`echo $line | awk -F\t '{print $2}'`)
+                OUTPORT=(`echo $line | awk -F\t '{print $4}'`)
+                PROTO=(`echo $line | awk -F\t '{print $3}'`)
+                ;;
+            IPRANGES*)
+                EXTRA=""
+                CIDR=(`echo $line | awk -F\t '{print $2}'`)
+
+                if [[ "$PORT_HAS_GLOBAL_RULE" = "$PROTO:$INPORT-$OUTPORT" ]] ; then
+                  EXTRA=" <= ** Redundant, /0 was already specified for $PORT_HAS_GLOBAL_RULE."
+                fi
+
+                if [[ "$CIDR" = "0.0.0.0/0" ]]; then
+                    EXTRA=" (!!)"
+                    PORT_HAS_GLOBAL_RULE="$PROTO:$INPORT-$OUTPORT" 
+                fi
+
+                echo -e "    => $PROTO:$INPORT->$OUTPORT\t\t$CIDR $EXTRA"
+                ;;
+            USERIDGROUPPAIRS*)
+                EXTRA=""
+                GROUPID=(`echo $line | awk -F\t '{print $2}'`)
+                GROUPNAME=(`echo $line | awk -F\t '{print $3}'`)
+
+                if [[ "$PORT_HAS_GLOBAL_RULE" = "$PROTO:$INPORT-$OUTPORT" ]] ; then
+                  EXTRA=" <= ** Redundant, /0 was already specified for $PORT_HAS_GLOBAL_RULE."
+                fi
+
+                echo -e "    => $PROTO:$INPORT->$OUTPORT\t\t$GROUPID ($GROUPNAME) $EXTRA"
+                ;;
+        esac
+    done
+    IFS=$old_IFS
+
+    rm $GFILE
+    rm $EC2FILE
+    rm $RDSFILE
+done
+
+
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+
+echo ""
